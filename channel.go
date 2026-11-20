@@ -98,8 +98,11 @@ type Channel struct {
 	cancels []chan string
 
 	// Allocated when in confirm mode in order to track publish counter and order confirms
-	confirms   *confirms
-	confirming atomic.Bool
+	confirms           *confirms
+	confirming         atomic.Bool
+	autoConfirmSession atomic.Bool
+	publishReady       atomic.Bool
+	publishOutbox      publishOutbox
 
 	// Selects on any errors from shutdown during RPC
 	errors chan *Error
@@ -246,6 +249,80 @@ func newChannel(c *Connection, id uint16) *Channel {
 // Signal that from now on, Channel.send() should call Channel.sendClosed()
 func (ch *Channel) setClosed() {
 	ch.closed.Store(true)
+	ch.publishReady.Store(false)
+}
+
+func (ch *Channel) reliablePublishing() bool {
+	return ch.connection != nil && ch.connection.IsRecoveryEnabled()
+}
+
+func (ch *Channel) confirmTracking() bool {
+	return ch.confirming.Load() || ch.autoConfirmSession.Load()
+}
+
+// ensurePublishConfirms enables broker confirmations for the lifetime of the
+// current channel session. Reliable publishing uses one confirm.select per
+// session and pipelines the per-message basic.ack frames.
+func (ch *Channel) ensurePublishConfirms() error {
+	if !ch.reliablePublishing() || ch.autoConfirmSession.Load() {
+		return nil
+	}
+
+	if err := ch.call(
+		&confirmSelect{Nowait: false},
+		&confirmSelectOk{},
+	); err != nil {
+		return err
+	}
+	ch.autoConfirmSession.Store(true)
+	return nil
+}
+
+func (ch *Channel) publishAcknowledgement(tag uint64, multiple bool) {
+	ch.publishOutbox.ack(tag, multiple)
+}
+
+func (ch *Channel) publishConfirmation(tag uint64, ack, multiple bool) {
+	if ch.confirmTracking() {
+		if multiple {
+			ch.confirms.Multiple(Confirmation{tag, ack})
+		} else {
+			ch.confirms.One(Confirmation{tag, ack})
+		}
+	}
+	if ack {
+		ch.publishAcknowledgement(tag, multiple)
+	}
+}
+
+// flushPendingPublishes rebinds queued publishings to the new broker confirm
+// sequence and writes them in their original order.
+func (ch *Channel) flushPendingPublishes() error {
+	if !ch.reliablePublishing() {
+		return nil
+	}
+
+	ch.m.Lock()
+	defer ch.m.Unlock()
+
+	for _, pending := range ch.publishOutbox.snapshot() {
+		if pending.tag == 0 {
+			ch.bindPendingPublish(pending)
+		}
+		if err := ch.send(pending.message()); err != nil {
+			ch.publishReady.Store(false)
+			return err
+		}
+	}
+
+	ch.publishReady.Store(true)
+	return nil
+}
+
+func (ch *Channel) bindPendingPublish(pending *pendingPublish) {
+	dc := ch.confirms.publish()
+	pending.dc = dc
+	ch.publishOutbox.bind(pending, dc.DeliveryTag)
 }
 
 // shutdown is called by Connection after the channel has been removed from the
@@ -528,22 +605,10 @@ func (ch *Channel) dispatch(msg message) {
 		ch.notifyM.RUnlock()
 
 	case *basicAck:
-		if ch.confirming.Load() {
-			if m.Multiple {
-				ch.confirms.Multiple(Confirmation{m.DeliveryTag, true})
-			} else {
-				ch.confirms.One(Confirmation{m.DeliveryTag, true})
-			}
-		}
+		ch.publishConfirmation(m.DeliveryTag, true, m.Multiple)
 
 	case *basicNack:
-		if ch.confirming.Load() {
-			if m.Multiple {
-				ch.confirms.Multiple(Confirmation{m.DeliveryTag, false})
-			} else {
-				ch.confirms.One(Confirmation{m.DeliveryTag, false})
-			}
-		}
+		ch.publishConfirmation(m.DeliveryTag, false, m.Multiple)
 
 	case *basicDeliver:
 		ch.consumers.send(m.ConsumerTag, newDelivery(ch, m))
@@ -1849,6 +1914,11 @@ by the server.  Add a listener with Channel.NotifyReturn to handle any
 undeliverable message when calling publish with either the mandatory or
 immediate parameters as true.
 
+When Config.Recovery is enabled, the channel enables publisher confirms and
+retains each publishing until the broker acknowledges it. Publishings that were
+not acknowledged before a reconnect are replayed in order, so delivery is at
+least once and replayed messages may be duplicated.
+
 Publishings can be undeliverable when the mandatory flag is true and no queue is
 bound that matches the routing key, or when the immediate flag is true and no
 consumer on the matched queue is ready to accept the delivery.
@@ -1890,6 +1960,11 @@ Since publishings are asynchronous, any undeliverable message will get returned
 by the server.  Add a listener with Channel.NotifyReturn to handle any
 undeliverable message when calling publish with either the mandatory or
 immediate parameters as true.
+
+When Config.Recovery is enabled, the channel enables publisher confirms and
+retains each publishing until the broker acknowledges it. Publishings that were
+not acknowledged before a reconnect are replayed in order, so delivery is at
+least once and replayed messages may be duplicated.
 
 Publishings can be undeliverable when the mandatory flag is true and no queue is
 bound that matches the routing key, or when the immediate flag is true and no
@@ -1934,6 +2009,10 @@ func (ch *Channel) PublishWithDeferredConfirm(exchange, key string, mandatory, i
 	ch.m.Lock()
 	defer ch.m.Unlock()
 
+	if ch.reliablePublishing() {
+		return ch.publishReliably(exchange, key, mandatory, immediate, msg)
+	}
+
 	var dc *DeferredConfirmation
 	if ch.confirming.Load() {
 		dc = ch.confirms.publish()
@@ -1945,21 +2024,7 @@ func (ch *Channel) PublishWithDeferredConfirm(exchange, key string, mandatory, i
 		Mandatory:  mandatory,
 		Immediate:  immediate,
 		Body:       msg.Body,
-		Properties: properties{
-			Headers:         msg.Headers,
-			ContentType:     msg.ContentType,
-			ContentEncoding: msg.ContentEncoding,
-			DeliveryMode:    msg.DeliveryMode,
-			Priority:        msg.Priority,
-			CorrelationId:   msg.CorrelationId,
-			ReplyTo:         msg.ReplyTo,
-			Expiration:      msg.Expiration,
-			MessageId:       msg.MessageId,
-			Timestamp:       msg.Timestamp,
-			Type:            msg.Type,
-			UserId:          msg.UserId,
-			AppId:           msg.AppId,
-		},
+		Properties: propertiesFromPublishing(msg),
 	}); err != nil {
 		if ch.confirming.Load() {
 			ch.confirms.unpublish()
@@ -1968,6 +2033,68 @@ func (ch *Channel) PublishWithDeferredConfirm(exchange, key string, mandatory, i
 	}
 
 	return dc, nil
+}
+
+func (ch *Channel) publishReliably(exchange, key string, mandatory, immediate bool, msg Publishing) (*DeferredConfirmation, error) {
+	if !ch.canRetainPublish() {
+		return nil, ErrClosed
+	}
+
+	pending := &pendingPublish{
+		exchange:  exchange,
+		key:       key,
+		mandatory: mandatory,
+		immediate: immediate,
+		msg:       clonePublishingForRetry(msg),
+	}
+	ch.publishOutbox.add(pending)
+	ch.bindPendingPublish(pending)
+
+	if ch.publishReady.Load() && !ch.IsClosed() && !ch.connection.IsClosed() {
+		if err := ch.send(pending.message()); err != nil {
+			if !ch.canRetainPublish() {
+				ch.publishOutbox.discard(pending)
+				ch.confirms.unpublish()
+				return nil, err
+			}
+			ch.publishReady.Store(false)
+		}
+	}
+
+	if ch.confirming.Load() {
+		return pending.dc, nil
+	}
+	return nil, nil
+}
+
+func (ch *Channel) canRetainPublish() bool {
+	if ch.closeInit.Load() {
+		return false
+	}
+	switch ch.connection.lifeCycle.State() {
+	case StateClosing, StateClosed:
+		return false
+	default:
+		return true
+	}
+}
+
+func propertiesFromPublishing(msg Publishing) properties {
+	return properties{
+		Headers:         msg.Headers,
+		ContentType:     msg.ContentType,
+		ContentEncoding: msg.ContentEncoding,
+		DeliveryMode:    msg.DeliveryMode,
+		Priority:        msg.Priority,
+		CorrelationId:   msg.CorrelationId,
+		ReplyTo:         msg.ReplyTo,
+		Expiration:      msg.Expiration,
+		MessageId:       msg.MessageId,
+		Timestamp:       msg.Timestamp,
+		Type:            msg.Type,
+		UserId:          msg.UserId,
+		AppId:           msg.AppId,
+	}
 }
 
 /*
@@ -2125,6 +2252,11 @@ When noWait is true, the client will not wait for a response.  A channel
 exception could occur if the server does not support this method.
 */
 func (ch *Channel) Confirm(noWait bool) error {
+	if ch.autoConfirmSession.Load() {
+		ch.confirming.Store(true)
+		return nil
+	}
+
 	if err := ch.call(
 		&confirmSelect{Nowait: noWait},
 		&confirmSelectOk{},
@@ -2267,6 +2399,7 @@ func (ch *Channel) closeResources(err error) {
 		if ch.confirms != nil {
 			ch.confirms.Close()
 		}
+		ch.publishOutbox.close()
 
 		ch.noNotify = true
 
@@ -2331,7 +2464,7 @@ func (ch *Channel) Reconnect() error {
 		}
 	}
 
-	return nil
+	return ch.flushPendingPublishes()
 }
 
 // openChannelSession resets client-side state, opens a fresh broker channel,
@@ -2503,6 +2636,11 @@ func (ch *Channel) reconnectChannel() error {
 func (ch *Channel) setupChannelBasic() error {
 	var err error
 
+	if err = ch.ensurePublishConfirms(); err != nil {
+		Logger.Printf("Channel %d recovery Confirm error: %v", ch.id, err)
+		return err
+	}
+
 	// Reset QoS if it was configured
 	config := ch.connection.getTopologyConfiguration(ch.id, false)
 	if config.Qos != nil {
@@ -2529,14 +2667,19 @@ func (ch *Channel) setupChannelBasic() error {
 func (ch *Channel) resetState() {
 	ch.closed.Store(false)
 	ch.destructed = false
+	ch.autoConfirmSession.Store(false)
+	ch.publishReady.Store(false)
+	ch.publishOutbox.reset()
+	if ch.confirms != nil {
+		ch.confirms.reset()
+		for _, pending := range ch.publishOutbox.snapshot() {
+			ch.bindPendingPublish(pending)
+		}
+	}
 
 	ch.errors = make(chan *Error, 1)
 	ch.close = make(chan struct{})
 	ch.rpc = make(chan message)
-
-	if ch.confirms != nil {
-		ch.confirms.reset()
-	}
 }
 
 // TopologyConfiguration returns a cloned, read-only snapshot of topology tracked for recovery.

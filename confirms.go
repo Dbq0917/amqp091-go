@@ -147,12 +147,18 @@ func newDeferredConfirmations() *deferredConfirmations {
 	}
 }
 
+func newDeferredConfirmation() *DeferredConfirmation {
+	dc := &DeferredConfirmation{}
+	dc.done = make(chan struct{})
+	return dc
+}
+
 func (d *deferredConfirmations) Add(tag uint64) *DeferredConfirmation {
 	d.m.Lock()
 	defer d.m.Unlock()
 
-	dc := &DeferredConfirmation{DeliveryTag: tag}
-	dc.done = make(chan struct{})
+	dc := newDeferredConfirmation()
+	dc.DeliveryTag = tag
 	d.confirmations[tag] = dc
 	return dc
 }

@@ -7,6 +7,7 @@ package amqp091
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,64 @@ import (
 
 	"github.com/rabbitmq/amqp091-go/internal/utils"
 )
+
+func TestConnectionRecoveryReplaysPublishesAfterDrop(t *testing.T) {
+	connectionName := "test-connection-recovery-replay-publishes"
+	properties := NewConnectionProperties()
+	properties.SetClientConnectionName(connectionName)
+	conn, err := DialConfig(amqpURL, Config{
+		Recovery:   &Recovery{},
+		Locale:     defaultLocale,
+		Properties: properties,
+	})
+	if err != nil {
+		t.Fatalf("DialConfig failed: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("Channel failed: %v", err)
+	}
+	defer ch.Close()
+
+	queue := fmt.Sprintf("test.recovery.replay.%d", time.Now().UnixNano())
+	if _, err := ch.QueueDeclare(queue, true, false, false, false, nil); err != nil {
+		t.Fatalf("QueueDeclare failed: %v", err)
+	}
+	defer func() { _, _ = ch.QueueDelete(queue, false, false, false) }()
+
+	stateChanged := make(chan *StateChanged, 10)
+	conn.NotifyStateChange(stateChanged)
+
+	dropConnection(t, connectionName)
+
+	const messages = 32
+	for i := 0; i < messages; i++ {
+		if err := ch.Publish("", queue, false, false, Publishing{
+			Body: fmt.Appendf(nil, "message-%d", i),
+		}); err != nil {
+			t.Fatalf("Publish %d failed: %v", i, err)
+		}
+	}
+
+	waitForConnectionOpen(t, stateChanged)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		queueInfo, err := ch.QueueInspect(queue)
+		if err == nil && queueInfo.Messages == messages {
+			return
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				t.Fatalf("QueueInspect failed: %v", err)
+			}
+			t.Fatalf("expected %d messages, got %d", messages, queueInfo.Messages)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 // TestConnectionRecoveryPublish tests the connection recovery for publish.
 func TestConnectionRecoveryPublish(t *testing.T) {

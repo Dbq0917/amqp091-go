@@ -758,11 +758,11 @@ func (c *Connection) setDeadline(t time.Time) error {
 }
 
 func (c *Connection) send(f frame) error {
+	c.sendM.Lock()
 	if c.IsClosed() {
+		c.sendM.Unlock()
 		return ErrClosed
 	}
-
-	c.sendM.Lock()
 	err := c.writer.WriteFrame(f)
 	c.sendM.Unlock()
 
@@ -809,11 +809,11 @@ func (c *Connection) endSendUnflushed() error {
 // but is otherwise equivalent to send() method, and we provide a separate
 // flush method to explicitly flush the buffer after all Frames are written.
 func (c *Connection) sendUnflushed(f frame) error {
+	c.sendM.Lock()
 	if c.IsClosed() {
+		c.sendM.Unlock()
 		return ErrClosed
 	}
-
-	c.sendM.Lock()
 	err := c.writer.WriteFrameNoFlush(f)
 	c.sendM.Unlock()
 
@@ -831,6 +831,10 @@ func (c *Connection) sendUnflushed(f frame) error {
 // This method is intended to be used with sendUnflushed() to explicitly flush
 // the buffer after all required Frames have been written to the buffer.
 func (c *Connection) flush() (err error) {
+	if c.IsClosed() {
+		return ErrClosed
+	}
+
 	if buf, ok := c.writer.w.(*bufio.Writer); ok {
 		err = buf.Flush()
 
@@ -1181,6 +1185,12 @@ func (c *Connection) openChannel() (*Channel, error) {
 		return nil, err
 	}
 
+	if err := ch.ensurePublishConfirms(); err != nil {
+		c.releaseChannel(ch)
+		ch.setClosed()
+		return nil, err
+	}
+	ch.publishReady.Store(true)
 	ch.lifeCycle.SetState(StateOpen, nil)
 
 	if c.IsRecoveryEnabled() {
@@ -1821,6 +1831,16 @@ func (c *Connection) Reconnect() (err error) {
 			if err != nil {
 				Logger.Printf("Connection recovery failed to recover topology: %v", err)
 				conn.Close()
+			}
+		}
+
+		if err == nil {
+			for _, ch := range channels {
+				if err = ch.flushPendingPublishes(); err != nil {
+					Logger.Printf("Connection recovery failed to replay pending publishes on channel %d: %v", ch.id, err)
+					conn.Close()
+					break
+				}
 			}
 		}
 
